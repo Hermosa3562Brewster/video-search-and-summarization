@@ -25,7 +25,7 @@ async function fetchFrameImage(
 ): Promise<HTMLImageElement> {
   const params = new URLSearchParams({ startTime: timestamp });
   const url = `${vstApiUrl}/v1/replay/stream/${sensorId}/picture?${params}`;
-  const response = await fetch(url, { signal, headers: { streamId: sensorId } });
+  const response = await fetch(url, { signal, headers: {} });
 
   if (!response.ok) {
     throw new Error(`Failed to fetch frame picture: ${response.status}`);

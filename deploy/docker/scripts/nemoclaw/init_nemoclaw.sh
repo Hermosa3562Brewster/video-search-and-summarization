@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
-# Configures NemoClaw to use NVIDIA's hosted Nemotron model via the NVIDIA API.
-# Requires a valid NVIDIA API key passed via --nvidia-api-key, NVIDIA_API_KEY env var, or interactive prompt.
+# Configures NemoClaw to use either NVIDIA's hosted Nemotron model (NEMOCLAW_PROVIDER=build)
+# or an OpenAI-compatible endpoint (NEMOCLAW_PROVIDER=custom).
+# For "build": requires NVIDIA_API_KEY (via --nvidia-api-key, env var, or interactive prompt).
+# For "custom": requires NEMOCLAW_ENDPOINT_URL and COMPATIBLE_API_KEY; NVIDIA_API_KEY is unused.
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]:-$0}")" && pwd)"
@@ -46,13 +48,14 @@ Usage:
   bash init_nemoclaw.sh [--nvidia-api-key <KEY>] [options]
   NVIDIA_API_KEY=<key> bash init_nemoclaw.sh [options]
 
-  The API key is resolved in this order:
+  When NEMOCLAW_PROVIDER=build, the NVIDIA API key is resolved in this order:
     1. --nvidia-api-key flag (overrides env)
     2. NVIDIA_API_KEY environment variable
     3. Interactive prompt (if neither is set)
+  When NEMOCLAW_PROVIDER=custom, NVIDIA_API_KEY is ignored — use --endpoint-url and --compatible-api-key.
 
 Options:
-  --nvidia-api-key KEY        NVIDIA API key (optional if NVIDIA_API_KEY env is set)
+  --nvidia-api-key KEY        NVIDIA API key (required when NEMOCLAW_PROVIDER=build; ignored for "custom")
   --sandbox-name NAME         Sandbox name (default: demo)
   --model NAME                NVIDIA model ID (default: nvidia/nemotron-3-super-120b-a12b)
   --nvidia-base-url URL       NVIDIA API base URL (default: https://integrate.api.nvidia.com/v1)
@@ -140,11 +143,14 @@ parse_args() {
     exit 1
   fi
 
-  if [ -z "${NVIDIA_API_KEY:-}" ]; then
+  # NVIDIA_API_KEY is only required for the "build" provider (NVIDIA Endpoints).
+  # In "custom" mode the OpenAI-compatible endpoint uses COMPATIBLE_API_KEY instead,
+  # which is validated separately in validate_custom_provider_settings().
+  if [ "${NEMOCLAW_PROVIDER}" = "build" ] && [ -z "${NVIDIA_API_KEY:-}" ]; then
     read -rsp "Enter your NVIDIA API key: " NVIDIA_API_KEY
     printf '\n'
     if [ -z "${NVIDIA_API_KEY:-}" ]; then
-      log "ERROR: NVIDIA API key is required."
+      log "ERROR: NVIDIA API key is required when NEMOCLAW_PROVIDER=build."
       exit 1
     fi
   fi

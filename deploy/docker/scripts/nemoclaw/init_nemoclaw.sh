@@ -261,14 +261,39 @@ configure_openshell_provider() {
 # onboard, and the forward can also die independently between runs — so refresh it unconditionally.
 ensure_dashboard_forward() {
   local port="${NEMOCLAW_DASHBOARD_PORT:-18789}"
+  local forward_log="/tmp/nemoclaw-forward-${port}.log"
+  local listener_pids pid
   if ! have openshell; then
     log "OpenShell not available yet; skipping dashboard port-forward refresh"
     return
   fi
   log "Refreshing dashboard port-forward on ${port} for sandbox ${NEMOCLAW_SANDBOX_NAME}"
+  if have curl && curl -fsS "http://127.0.0.1:${port}/health" 2>/dev/null | grep -q '"ok"[[:space:]]*:[[:space:]]*true'; then
+    log "Dashboard port-forward on ${port} is already healthy; keeping existing listener"
+    return
+  fi
+
   openshell forward stop "$port" >/dev/null 2>&1 || true
-  if ! openshell forward start --background "$port" "$NEMOCLAW_SANDBOX_NAME" </dev/null >/dev/null 2>&1; then
+  pkill -TERM -f "[o]penshell forward start ${port} ${NEMOCLAW_SANDBOX_NAME}" >/dev/null 2>&1 || true
+  if have lsof; then
+    listener_pids="$(lsof -tiTCP:"${port}" -sTCP:LISTEN 2>/dev/null || true)"
+    for pid in $listener_pids; do
+      kill "$pid" >/dev/null 2>&1 || true
+    done
+  fi
+
+  if have setsid; then
+    setsid -f openshell forward start "$port" "$NEMOCLAW_SANDBOX_NAME" </dev/null >"$forward_log" 2>&1 || true
+  else
+    openshell forward start --background "$port" "$NEMOCLAW_SANDBOX_NAME" </dev/null >"$forward_log" 2>&1 || true
+  fi
+
+  sleep 1
+  if have curl && ! curl -fsS "http://127.0.0.1:${port}/health" 2>/dev/null | grep -q '"ok"[[:space:]]*:[[:space:]]*true'; then
     log "WARN: could not (re)start dashboard forward on ${port}; the OpenClaw UI and /hooks endpoint will be unreachable at http://127.0.0.1:${port}"
+    if [ -f "$forward_log" ]; then
+      tail -n 20 "$forward_log" | sed 's/^/[init_nvidia_remote] forward log: /' >&2 || true
+    fi
   fi
 }
 
@@ -324,8 +349,34 @@ apply_vss_policy() {
   nemoclaw "$NEMOCLAW_SANDBOX_NAME" policy-add --from-file "$policy_file" --yes
 }
 
+restart_vss_openclaw_gateway() {
+  local port attempt
+  port="${NEMOCLAW_DASHBOARD_PORT:-18789}"
+
+  if ! have openshell; then
+    log "OpenShell is not available; cannot restart OpenClaw gateway"
+    return 1
+  fi
+
+  log "Restarting OpenClaw gateway in sandbox ${NEMOCLAW_SANDBOX_NAME}"
+  openshell sandbox exec -n "${NEMOCLAW_SANDBOX_NAME}" -- sh -lc \
+    "pkill -TERM -f '[o]penclaw-gateway' || true" || true
+
+  for attempt in $(seq 1 30); do
+    if openshell sandbox exec -n "${NEMOCLAW_SANDBOX_NAME}" -- sh -lc \
+        "curl -fsS http://127.0.0.1:${port}/health >/dev/null"; then
+      log "OpenClaw gateway is healthy after restart"
+      return 0
+    fi
+    sleep 1
+  done
+
+  log "WARN: OpenClaw gateway did not become healthy within 30 seconds after restart"
+  return 1
+}
+
 install_vss_openclaw_plugin() {
-  local plugin_dir tgz_name tgz_path container_name remote_tgz install_cmd
+  local plugin_dir tgz_name tgz_path container_name remote_tgz install_cmd shell_cmd
   plugin_dir="${OPENCLAW_PLUGIN_DIR}"
 
   if [ ! -f "${plugin_dir}/package.json" ]; then
@@ -370,32 +421,46 @@ install_vss_openclaw_plugin() {
   # Clean up the local tarball on every return path (success, upload failure, install failure).
   trap 'rm -f "${tgz_path}"; trap - RETURN' RETURN
 
-  # Stream the tarball into the agent container via kubectl exec stdin. `openshell
-  # sandbox upload` silently dropped the file (reported success, but it never landed
-  # anywhere visible to the install step), so we write the bytes directly through the
-  # same kubectl exec path the install will use.
-  log "Streaming ${tgz_name} into sandbox ${NEMOCLAW_SANDBOX_NAME}:${remote_tgz}"
-  if ! sudo docker exec -i "${container_name}" kubectl exec -i -n "${VSS_NAMESPACE}" "${NEMOCLAW_SANDBOX_NAME}" -- \
-      sh -c "cat > '${remote_tgz}'" < "${tgz_path}"; then
-    log "ERROR: failed to stream ${tgz_name} into sandbox ${NEMOCLAW_SANDBOX_NAME}"
-    return 1
-  fi
-
   # --dangerously-force-unsafe-install: the plugin's index.ts uses child_process (npx skills add agent-browser,
   # systemctl daemon-reload), which OpenClaw's install-time scanner flags. We trust this first-party plugin.
   # printf %q shell-escapes both interpolated values so a quote in tgz_name or
-  # OPENCLAW_PLUGIN_VARIANT can't break out of `su - sandbox -c`'s quoting.
+  # OPENCLAW_PLUGIN_VARIANT can't break out of the remote shell command.
   printf -v install_cmd 'OPENCLAW_PLUGIN_VARIANT=%q openclaw plugins install %q --force --dangerously-force-unsafe-install' \
     "${OPENCLAW_PLUGIN_VARIANT}" "${remote_tgz}"
   log "Installing VSS OpenClaw plugin ${tgz_name} into sandbox ${NEMOCLAW_SANDBOX_NAME} (variant=${OPENCLAW_PLUGIN_VARIANT})"
   log "Plugin install command: ${install_cmd}"
-  if ! sudo docker exec "${container_name}" kubectl exec -n "${VSS_NAMESPACE}" "${NEMOCLAW_SANDBOX_NAME}" -- \
-      sh -lc "$(printf 'su - sandbox -c %q && rm -f %q' "${install_cmd}" "${remote_tgz}")"; then
-    log "ERROR: openclaw plugins install failed for ${tgz_name}"
-    return 1
+
+  if [[ "${container_name}" == nemoclaw-openshell-* ]]; then
+    log "Streaming ${tgz_name} into sandbox ${NEMOCLAW_SANDBOX_NAME}:${remote_tgz}"
+    printf -v shell_cmd 'cat > %q' "${remote_tgz}"
+    if ! openshell sandbox exec -n "${NEMOCLAW_SANDBOX_NAME}" -- sh -c "${shell_cmd}" < "${tgz_path}"; then
+      log "ERROR: failed to stream ${tgz_name} into sandbox ${NEMOCLAW_SANDBOX_NAME}"
+      return 1
+    fi
+
+    printf -v shell_cmd '%s && rm -f %q' "${install_cmd}" "${remote_tgz}"
+    if ! openshell sandbox exec -n "${NEMOCLAW_SANDBOX_NAME}" -- sh -lc "${shell_cmd}"; then
+      log "ERROR: openclaw plugins install failed for ${tgz_name}"
+      return 1
+    fi
+  else
+    log "Streaming ${tgz_name} into sandbox ${NEMOCLAW_SANDBOX_NAME}:${remote_tgz}"
+    if ! sudo docker exec -i "${container_name}" kubectl exec -i -n "${VSS_NAMESPACE}" "${NEMOCLAW_SANDBOX_NAME}" -- \
+        sh -c "cat > '${remote_tgz}'" < "${tgz_path}"; then
+      log "ERROR: failed to stream ${tgz_name} into sandbox ${NEMOCLAW_SANDBOX_NAME}"
+      return 1
+    fi
+
+    if ! sudo docker exec "${container_name}" kubectl exec -n "${VSS_NAMESPACE}" "${NEMOCLAW_SANDBOX_NAME}" -- \
+        sh -lc "$(printf 'su - sandbox -c %q && rm -f %q' "${install_cmd}" "${remote_tgz}")"; then
+      log "ERROR: openclaw plugins install failed for ${tgz_name}"
+      return 1
+    fi
   fi
 
   log "VSS OpenClaw plugin installed"
+  restart_vss_openclaw_gateway || return 1
+  ensure_dashboard_forward
 }
 
 validate_custom_provider() {

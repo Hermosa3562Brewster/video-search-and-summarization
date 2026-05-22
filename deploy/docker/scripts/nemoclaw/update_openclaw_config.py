@@ -50,6 +50,7 @@ def run_kubectl_exec(
     sandbox_name: str,
     remote_args: list[str],
     capture_output: bool = False,
+    input_text: str | None = None,
 ) -> subprocess.CompletedProcess:
     """Exec a command inside a sandbox.
 
@@ -73,6 +74,7 @@ def run_kubectl_exec(
         check=True,
         text=True,
         capture_output=capture_output,
+        input=input_text,
     )
 
 
@@ -144,12 +146,15 @@ def write_remote_file(
     config_path: str,
     content: str,
 ) -> None:
-    shell_cmd = f"cat > {shlex.quote(config_path)} <<'EOF'\n{content}EOF"
+    # The OpenShell exec API rejects newline characters inside argv. Stream
+    # file content over stdin instead of embedding it in a heredoc argument.
+    shell_cmd = f"cat > {shlex.quote(config_path)}"
     run_kubectl_exec(
         container,
         namespace,
         sandbox_name,
         ["sh", "-c", shell_cmd],
+        input_text=content,
     )
 
 
@@ -180,12 +185,17 @@ def chmod_and_chown(
         sandbox_name,
         ["chmod", "644", config_path],
     )
-    run_kubectl_exec(
-        container,
-        namespace,
-        sandbox_name,
-        ["chown", "sandbox:sandbox", config_path],
-    )
+    try:
+        run_kubectl_exec(
+            container,
+            namespace,
+            sandbox_name,
+            ["chown", "sandbox:sandbox", config_path],
+        )
+    except subprocess.CalledProcessError:
+        # Docker-driver exec runs as the sandbox user, not root. The file is
+        # normally already owned by sandbox:sandbox, so chown is best-effort.
+        pass
 
 
 def get_dashboard_token(
@@ -363,6 +373,7 @@ def main() -> int:
     agents_defaults = data.setdefault("agents", {}).setdefault("defaults", {})
     if agents_defaults.get("workspace") != DEFAULT_WORKSPACE_DIR:
         agents_defaults["workspace"] = DEFAULT_WORKSPACE_DIR
+        changed = True
     if update_hooks_config(
         data,
         enabled=args.enable_hooks,

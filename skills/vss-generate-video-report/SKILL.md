@@ -67,16 +67,38 @@ Hand off to `/vss-manage-video-io-storage` to:
 
 ### Step 2 — Resolve VLM endpoint and model
 
-Both come from the agent's `vss_agent/configs/config.yml` (`llms.nim_vlm.base_url` = `${VLM_BASE_URL}/v1`, `llms.nim_vlm.model_name` = `${VLM_NAME}`). Read them off the running container — do not guess:
+The deploy may serve the VLM through either of two stacks. Both expose an OpenAI-compatible `chat/completions` API — pick whichever is live:
+
+| Backend | Env vars | Typical host endpoint | Picked when |
+|---|---|---|---|
+| **NIM Cosmos** | `VLM_BASE_URL`, `VLM_NAME` | `${VLM_BASE_URL}/v1` (no trailing `/v1` on the env var; the agent appends it) | `VLM_MODE` ∈ {`local`, `local_shared`, `remote`} **and** `VLM_BASE_URL` is non-empty |
+| **RT-VLM Cosmos** | `RTVI_VLM_BASE_URL`, `RTVI_VLM_MODEL_TO_USE` (model identifier on the RT-VLM side, e.g. `cosmos-reason2`) | `${RTVI_VLM_BASE_URL}/v1` — alerts default `http://${HOST_IP}:8018/v1`, base default `http://${HOST_IP}:30082/v1` (`RTVI_VLM_ENDPOINT`) | `VLM_MODE=none` **or** `VLM_BASE_URL` empty; also the only path for `warehouse` |
+
+Read the live values off the running agent container — do not guess:
 
 ```bash
-docker exec vss-agent env | grep -E '^(VLM_BASE_URL|VLM_NAME)=' 
-# typical alerts profile defaults:
-#   VLM_BASE_URL=http://${HOST_IP}:8009     (no trailing /v1)
-#   VLM_NAME=nvidia/cosmos-reason2-8b
+docker exec vss-agent env | grep -E '^(VLM_BASE_URL|VLM_NAME|VLM_MODE|RTVI_VLM_BASE_URL|RTVI_VLM_ENDPOINT|RTVI_VLM_MODEL_TO_USE)='
 ```
 
-Bind to `VLM_BASE_URL` and `VLM_NAME`. If `docker exec` is unavailable, fall back to `grep -E '^(VLM_BASE_URL|VLM_NAME)=' .../dev-profile-base/generated.env`.
+Selection rule:
+
+```bash
+if [ -n "${VLM_BASE_URL}" ] && [ "${VLM_MODE}" != "none" ]; then
+  VLM_ENDPOINT="${VLM_BASE_URL%/}/v1"
+  VLM_MODEL="${VLM_NAME}"
+else
+  VLM_ENDPOINT="${RTVI_VLM_ENDPOINT:-${RTVI_VLM_BASE_URL%/}/v1}"
+  VLM_MODEL="${RTVI_VLM_MODEL_TO_USE}"
+fi
+```
+
+Probe `/v1/models` before sending a chat request to confirm the chosen endpoint is alive and the model is loaded:
+
+```bash
+curl -sf --max-time 5 "${VLM_ENDPOINT}/models" | jq -r '.data[].id'
+```
+
+If the probe fails or the listed ids don't include `${VLM_MODEL}`, fall back to the other backend (or surface the error — never silently pick a model that isn't on the server).
 
 ### Step 3 — Call the VLM directly
 
@@ -97,11 +119,11 @@ Your reasoning.
 
 Write your final answer immediately after the </think> tag."
 
-curl -s -X POST "${VLM_BASE_URL}/v1/chat/completions" \
+curl -s -X POST "${VLM_ENDPOINT}/chat/completions" \
   -H "Content-Type: application/json" \
   -d @- <<EOF | jq -r '.choices[0].message.content'
 {
-  "model": "${VLM_NAME}",
+  "model": "${VLM_MODEL}",
   "messages": [
     {
       "role": "user",
@@ -133,7 +155,7 @@ If the VLM returns a `<think>…</think>` block (Cosmos Reason reasoning mode), 
 | **Time of Analysis** | <HH:MM:SS> |
 | **Video Source** | <sensor_id or filename> |
 | **Clip Range** | <startTime> – <endTime> |
-| **VLM** | <VLM_NAME> |
+| **VLM** | <VLM_MODEL (NIM or RT-VLM)> |
 | **Analysis Request** | <user's request> |
 
 ## Analysis Results

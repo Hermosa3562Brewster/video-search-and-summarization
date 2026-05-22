@@ -51,15 +51,19 @@ def run_kubectl_exec(
     remote_args: list[str],
     capture_output: bool = False,
 ) -> subprocess.CompletedProcess:
+    """Exec a command inside a sandbox.
+
+    Name kept for caller compatibility. The legacy kubectl-driver path
+    ran `sudo docker exec <gateway> kubectl exec -n <ns> <sandbox> -- ...`;
+    the Docker-driver gateway has no kubectl, so we now use
+    `openshell sandbox exec` instead. `container` and `namespace` are
+    accepted for backwards compat but unused.
+    """
     cmd = [
-        "sudo",
-        "docker",
-        "exec",
-        container,
-        "kubectl",
+        "openshell",
+        "sandbox",
         "exec",
         "-n",
-        namespace,
         sandbox_name,
         "--",
         *remote_args,

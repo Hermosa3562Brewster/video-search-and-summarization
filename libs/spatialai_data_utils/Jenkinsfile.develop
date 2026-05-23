@@ -1,0 +1,306 @@
+@Library('met-jenkins-shared-library') _
+
+def BUILD_TYPE="dev"
+def PACKAGE_VERSION="2.0.0"
+def SOURCE_NAME="spatialai-data-utils"
+def slackResponse=notifyBuild(null, 'STARTED')
+
+podTemplate (cloud:'sc-ipp-blossom-prod', yaml : """
+apiVersion: v1
+kind: Pod
+metadata:
+    labels:
+        label: spatialai-data-utils
+spec:
+  imagePullSecrets:
+  - name: svc-mtmc-ngc-ro-secret
+  containers:
+  - name: python-313
+    image: python:3.13-slim
+    securityContext:
+        privileged: true
+    restartPolicy: Never
+    backoffLimit: 4
+    tty: true
+  - name: docker
+    image: docker:23.0.6-dind
+    securityContext:
+      privileged: true
+    env:
+      - name: DOCKER_TLS_CERTDIR
+        value: ""
+  - name: jenkins-shared-lib-base
+    image: nvcr.io/metropolis/a3ieng/msv:0.0.4
+    imagePullPolicy: "Always"
+    env:
+    - name: JENKINS_URL
+      value: "${env.JENKINS_URL}"
+    command:
+    - sleep
+    args:
+    - 1d
+  nodeSelector:
+    kubernetes.io/os: linux
+"""
+) {
+    node(POD_LABEL) {
+        properties([
+            parameters([
+                string(name: 'EMAIL_REPORT', defaultValue: 'kartikayt@nvidia.com,munjalp@nvidia.com,gaiyer@nvidia.com,yizwang@nvidia.com,spusegaonkar@nvidia.com,yunh@nvidia.com', description: 'Email to send the test/build report to'),
+                string(name: 'NGC_ORG', defaultValue: 'nv-metropolis-dev', description: 'NGC org for uploading test results CSV (leave empty to skip upload)'),
+                string(name: 'NGC_TEAM', defaultValue: 'metropolis-analytic', description: 'NGC team for uploading test results CSV'),
+                string(name: 'NGC_RESOURCE_NAME', defaultValue: 'test_results', description: 'NGC resource name for test results CSV'),
+                string(name: 'NGC_RESOURCE_VERSION', defaultValue: '', description: 'NGC resource version (leave empty for spatialai-data-utils-2.0.0-dev<build_number>)'),
+                string(name: 'NGC_API_KEY_CREDENTIAL_ID', defaultValue: 'ngc-personal-key-alert-bridge-evaluator', description: 'Jenkins credential ID for NGC CLI API key')
+            ])
+        ])
+        def ngcVersion = (params.NGC_RESOURCE_VERSION ?: '').trim()
+        def sourceVersion = "${PACKAGE_VERSION}-${BUILD_TYPE}${env.BUILD_NUMBER}"
+        def testResultsCsvName = ngcVersion ? "${ngcVersion}.csv" : "${SOURCE_NAME}-${sourceVersion}.csv"
+        try {
+            withEnv(["VERSION_SUFFIX=${BUILD_TYPE}${env.BUILD_NUMBER}"]) {
+                container('python-313') {
+                    stage ("checkout") {
+                        gitlabCommitStatus(name: 'checkout', connection: gitLabConnection('git-lab-master')) {
+                            sh 'env | sort'
+                            checkout scm
+                            sh 'ls -lrt; pwd'
+                        }
+                    }
+                    stage ('test-coverage') {
+                        gitlabCommitStatus(name: 'test-coverage', connection: gitLabConnection('git-lab-master')) {
+                            echo "Running Python tests with coverage..."
+                            sh "apt-get update && apt-get install -y --no-install-recommends git g++"
+                            sh "pip3 install setuptools wheel pytest pytest-cov"
+                            // numpy 1.26.x has no cp313 wheel on PyPI (1.26.4
+                            // was the last 1.x release; 1.26.5 was never
+                            // published — the next release was 2.0). Our
+                            // local test env pins numpy 1.26.4, so we keep
+                            // that exact version and pre-install the
+                            // `meson-python` + `ninja` build backend numpy's
+                            // sdist needs, instead of bumping to numpy 2.x
+                            // (compatibility implications for the rest of
+                            // the package).
+                            sh "pip3 install meson-python ninja 'Cython>=0.29.34,<3.1'"
+                            sh "pip3 install torch==2.10.0+cpu --extra-index-url https://download.pytorch.org/whl/cpu"
+                            sh "pip3 install ninja==1.11.1.1 fvcore==0.1.5.post20221221 iopath==0.1.10"
+                            sh "git clone https://github.com/facebookresearch/pytorch3d.git /tmp/pytorch3d && cd /tmp/pytorch3d && git checkout 33824be && MAX_JOBS=4 FORCE_CUDA=0 pip3 install --no-build-isolation . && cd -"
+                            // Editable install of release/ pulls
+                            // nuscenes-devkit==1.2.0 which constrains
+                            // numpy<2, so pip downgrades to numpy 1.26.4 —
+                            // the only 1.x version pip can find. There is no
+                            // cp313 wheel for it (1.26.5 was never released
+                            // and 2.0 was the next), so numpy is built from
+                            // sdist via meson, which needs g++. Keep the
+                            // toolchain installed until after this step,
+                            // then clean up.
+                            sh "pip3 install --no-build-isolation -e release/"
+                            sh "apt-get remove -y git g++ && rm -rf /var/lib/apt/lists/* /tmp/pytorch3d"
+                            sh "mkdir -p tests/coverage"
+                            def testExitCode = sh(script: "pytest tests/ -v --junitxml=tests/coverage/test-results.xml --cov=spatialai_data_utils --cov-report=html:tests/coverage --cov-report=term", returnStatus: true)
+                            echo "\n================================================="
+                            echo "Test Results Summary"
+                            echo "================================================="
+                            sh "pytest tests/ --co -q 2>/dev/null || true"
+                            echo "=================================================\n"
+                            publishHTML([
+                                allowMissing: true,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: 'tests/coverage',
+                                reportFiles: 'index.html',
+                                reportName: 'Code Coverage Report',
+                                reportTitles: 'Coverage'
+                            ])
+                            if (testExitCode != 0) {
+                                currentBuild.result = 'FAILED'
+                                echo "Tests failed with exit code: ${testExitCode}"
+                            } else {
+                                echo "Tests passed and coverage reports generated"
+                            }
+                        }
+                    }
+                    stage ('publish-test-results') {
+                        junit(
+                            testResults: 'tests/coverage/test-results.xml',
+                            allowEmptyResults: true,
+                            skipPublishingChecks: false,
+                            keepLongStdio: true
+                        )
+                        container('jenkins-shared-lib-base') {
+                            script {
+                                dir(env.WORKSPACE) {
+                                    echo "================================"
+                                    echo "Generating AI Test Summary"
+                                    echo "================================"
+                                    def junitXmlPath = "${env.WORKSPACE}/tests/coverage/test-results.xml"
+                                    echo "JUnit XML path: ${junitXmlPath}"
+                                    def junitExists = sh(script: "test -f '${junitXmlPath}' && echo true || echo false", returnStdout: true).trim() == 'true'
+                                    def testSummary = null
+                                    if (junitExists) {
+                                        try {
+                                            testSummary = summarizeTests(
+                                                junitXmlPath: junitXmlPath,
+                                                provider: 'nim',
+                                                apiKeyCredentialId: 'nvidia-nim-api-key-test',
+                                                model: 'meta/llama-3.1-70b-instruct',
+                                                csvFile: 'test-summary.csv',
+                                                testResultsCsvFile: testResultsCsvName
+                                            )
+                                        } catch (Exception e) {
+                                            echo "⚠️  WARNING: Test summary generation failed: ${e.message}"
+                                            testSummary = [success: false, message: "Parse/generation failed: ${e.message}"]
+                                        }
+                                    } else {
+                                        echo "⚠️  No JUnit XML at ${junitXmlPath}; creating placeholder CSVs"
+                                        testSummary = [success: false, message: 'No JUnit XML - build failed before Test stage']
+                                    }
+                                    if (!testSummary?.success) {
+                                        def jobName = env.JOB_NAME ?: 'unknown'
+                                        def reportUrl = (env.BUILD_URL ?: '') + 'testReport/'
+                                        writeFile file: 'test-summary.csv', text: "\"job_name\",\"total_tests\",\"passed\",\"failed\",\"skipped\",\"pass_rate\",\"test_summary\",\"test_report\"\n\"${jobName}\",\"0\",\"0\",\"0\",\"0\",\"0%\",\"No test results (build failed before Test stage or summary failed).\",\"${reportUrl}\"\n"
+                                        writeFile file: testResultsCsvName, text: "\"Test_Name\",\"Status\",\"Duration_Seconds\",\"Timestamp\",\"Details\",\"Error_Message\"\n\"(no tests)\",\"N/A\",\"0\",\"\",\"No test results - build failed before Test stage or summary failed.\",\"\"\n"
+                                    }
+                                    if (testSummary?.success) {
+                                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                        echo "✅ Test Summary Generated Successfully"
+                                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                        echo "Total Tests: ${testSummary.totalTests}"
+                                        echo "✅ Passed: ${testSummary.passed}"
+                                        echo "❌ Failed: ${testSummary.failed}"
+                                        echo "⏭️  Skipped: ${testSummary.skipped}"
+                                        echo "📊 Test Report: ${testSummary.reportUrl}"
+                                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                    }
+                                    // Upload test results CSV to NGC (optional, same pattern as py-analytics-stream)
+                                    def ngcOrg = (params.NGC_ORG ?: '').trim()
+                                    def ngcTeam = (params.NGC_TEAM ?: '').trim()
+                                    def testResultsCsvExists = sh(script: "test -f '${testResultsCsvName}' && echo true || echo false", returnStdout: true).trim() == 'true'
+                                    if (ngcOrg && ngcTeam && testResultsCsvExists) {
+                                        def ngcResourceName = (params.NGC_RESOURCE_NAME ?: 'test_results').trim()
+                                        def paramVersion = (params.NGC_RESOURCE_VERSION ?: '').trim()
+                                        def ngcResourceVersion = (paramVersion == '' || paramVersion.contains('${')) ? "${SOURCE_NAME}-${sourceVersion}" : paramVersion
+                                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                        echo "📤 Uploading test results CSV to NGC: ${ngcOrg}/${ngcTeam}/${ngcResourceName}:${ngcResourceVersion}"
+                                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                        withCredentials([string(credentialsId: params.NGC_API_KEY_CREDENTIAL_ID ?: 'ngc-api-key', variable: 'NGC_CLI_API_KEY')]) {
+                                            def pushResult = pushTestResults(
+                                                csvFile: testResultsCsvName,
+                                                ngcOrg: ngcOrg,
+                                                ngcTeam: ngcTeam,
+                                                resourceName: ngcResourceName,
+                                                version: ngcResourceVersion,
+                                                ngcApiKey: env.NGC_CLI_API_KEY,
+                                                shortDesc: "Test results - ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+                                            )
+                                            if (pushResult.success) {
+                                                echo "✅ Test results CSV uploaded to NGC"
+                                            } else {
+                                                echo "⚠️  NGC upload failed: ${pushResult.message}"
+                                            }
+                                        }
+                                    } else if (ngcOrg || ngcTeam) {
+                                        echo "⚠️  NGC upload skipped: set both NGC_ORG and NGC_TEAM and ensure ${testResultsCsvName} exists"
+                                    }
+                                    def buildStatus = currentBuild.result ?: 'SUCCESS'
+                                    if (buildStatus != 'SUCCESS') {
+                                        explainError(
+                                            provider: 'nim',
+                                            apiKeyCredentialId: 'nvidia-nim-api-key-test',
+                                            outputFormat: 'csv',
+                                            csvFile: 'build-errors.csv',
+                                            model: 'meta/llama-3.1-70b-instruct'
+                                        )
+                                    }
+                                    echo "================================"
+                                }
+                            }
+                        }
+                    }
+                    stage ('py-package') {
+                        gitlabCommitStatus(name: 'py-package', connection: gitLabConnection('git-lab-master')) {
+                            sh "apt-get update && apt-get install -y --no-install-recommends curl"
+                            sh "pwd"
+                            sh "ls -lrt"
+                            echo "VERSION_SUFFIX: ${env.VERSION_SUFFIX}"
+                            sh "python --version"
+                            sh "pip3 install setuptools wheel"
+                            sh """
+                            cd release
+                            python3 setup.py sdist bdist_wheel
+                            ls -lrt dist
+                            """
+                            sh "pip3 install twine"
+                            withCredentials([string(credentialsId: 'sw-mdx-pypi-local-deploy-token', variable: 'TOKEN')]) {
+                                 sh """
+                                 set +xx
+                                 twine upload  --repository-url https://urm.nvidia.com/artifactory/api/pypi/sw-metropolis-pypi-local -u svc-mdx-rw -p $TOKEN release/dist/spatialai_data_utils-${PACKAGE_VERSION}.${env.VERSION_SUFFIX}-py3-none-any.whl --verbose
+                                 export VERSION_SUFFIX=''
+                                 cd release
+                                 python3 setup.py sdist bdist_wheel
+                                 ls -lrt dist
+                                 echo "Starting deletion of version ${PACKAGE_VERSION}"
+                                 curl -u svc-mdx-rw:${TOKEN} -X DELETE https://urm.nvidia.com/artifactory/sw-metropolis-pypi-local/spatialai-data-utils/${PACKAGE_VERSION}/ || true
+                                 echo "successfully Deleted spatialai-data-utils-${PACKAGE_VERSION}"
+                                 twine upload --repository-url https://urm.nvidia.com/artifactory/api/pypi/sw-metropolis-pypi-local -u svc-mdx-rw -p $TOKEN dist/spatialai_data_utils-${PACKAGE_VERSION}-py3-none-any.whl --verbose
+                                 """
+                             }
+                            writeFile file: 'build-info.txt', text: """URM_URL=https://urm.nvidia.com/artifactory/sw-metropolis-pypi-local/spatialai-data-utils/
+PACKAGE_VERSION=${PACKAGE_VERSION}
+VERSION_SUFFIX=${env.VERSION_SUFFIX}
+"""
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            currentBuild.result = "FAILED"
+            notifyBuild(slackResponse.threadId, currentBuild.result)
+            throw e
+        } finally {
+            stash(includes: "test-summary.csv,${testResultsCsvName}", name: 'test-reports', allowEmpty: true)
+            if (fileExists('build-info.txt')) {
+                stash(includes: 'build-info.txt', name: 'build-info')
+            }
+            if (fileExists('build-errors.csv')) {
+                stash(includes: 'build-errors.csv', name: 'build-errors')
+            }
+            notifyBuild(slackResponse.threadId, currentBuild.result)
+            container('jenkins-shared-lib-base') {
+                script {
+                    def emailTo = (params.EMAIL_REPORT ?: '').trim()
+                    if (!emailTo) {
+                        echo "⚠️  EMAIL_REPORT not set; skipping final email"
+                        return
+                    }
+                    def buildStatus = currentBuild.result ?: 'SUCCESS'
+                    def urmUrl = "N/A"
+                    if (fileExists('build-info.txt')) {
+                        def info = readFile('build-info.txt')
+                        def urmLine = info.split('\n').find { it.startsWith('URM_URL=') }
+                        if (urmLine) urmUrl = urmLine.replaceFirst('URM_URL=', '').trim()
+                    }
+                    def testReportSummary = "See attached test-summary.csv and ${testResultsCsvName} (per-test results)."
+                    def emailSubject = buildStatus == 'SUCCESS' ? "✅ Build Succeeded - ${env.JOB_NAME} #${env.BUILD_NUMBER}" : "❌ Build Failed - ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+                    def emailBody = "${buildStatus == 'SUCCESS' ? 'Build completed successfully!' : 'Build failed with errors.'}\n\n📊 ${testReportSummary}\n\n🔗 URM package URL: ${urmUrl}\n\nBuild URL: ${env.BUILD_URL}\nConsole: ${env.BUILD_URL}console"
+                    if (buildStatus != 'SUCCESS') {
+                        emailBody += "\n\n🔴 Failed test cases / error analysis: see attached build-errors.csv and ${testResultsCsvName}"
+                    }
+                    def emailBodyCrlf = emailBody.replaceAll('\n', '\r\n')
+                    def emailBodyHtml = emailBody.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('\n', '<br>')
+                    def attachments = []
+                    if (fileExists('test-summary.csv')) attachments.add([path: 'test-summary.csv', title: 'Test Summary Report'])
+                    if (fileExists(testResultsCsvName)) attachments.add([path: testResultsCsvName, title: 'Test Results (per-test)'])
+                    if (fileExists('build-errors.csv')) attachments.add([path: 'build-errors.csv', title: 'Failed Tests / Build Error Analysis'])
+                    if (attachments.isEmpty()) {
+                        echo "⚠️  No report files to attach; sending summary only"
+                    } else {
+                        echo "📧 Sending final email to: ${emailTo} (${attachments.size()} attachments)"
+                        sendEmail(filePaths: attachments, to: emailTo, subject: emailSubject, text: emailBodyCrlf, html: emailBodyHtml)
+                        echo "✅ Final email sent successfully!"
+                    }
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,27 @@
+image: python:3.13.13
+
+stages:
+  - test
+
+###################
+###   TESTING   ###
+###################
+
+unit_tests:
+  stage: test
+  script:
+    - pip install --upgrade pip setuptools wheel
+    # numpy 1.26.x has no cp313 wheel on PyPI (1.26.4 was the last 1.x
+    # release; 1.26.5 was never published — the next release was 2.0).
+    # Our local test env pins numpy 1.26.4, so we keep that exact version
+    # and pre-install the `meson-python` + `ninja` build backend numpy's
+    # sdist needs, instead of bumping to numpy 2.x (which has compatibility
+    # implications for the rest of the package).
+    - pip install meson-python ninja "Cython>=0.29.34,<3.1"
+    - pip install torch==2.10.0+cpu --extra-index-url https://download.pytorch.org/whl/cpu
+    - pip install ninja==1.11.1.1 fvcore==0.1.5.post20221221 iopath==0.1.9
+    - git clone https://github.com/facebookresearch/pytorch3d.git /tmp/pytorch3d && cd /tmp/pytorch3d && git checkout 33824be && MAX_JOBS=4 FORCE_CUDA=0 pip install --no-build-isolation . && cd -
+    - pip install --no-build-isolation -e ./release
+    - pip install pytest pytest-cov h5py
+    - pytest tests/ -v --junitxml=test-results.xml --cov=spatialai_data_utils --cov-report=term --cov-report=html:coverage
+  coverage: '/TOTAL.*\s+(\d+\.?\d*)%/'

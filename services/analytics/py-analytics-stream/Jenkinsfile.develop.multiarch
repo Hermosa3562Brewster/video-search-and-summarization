@@ -1,0 +1,530 @@
+@Library('met-jenkins-shared-library') _
+
+def BUILD_TYPE="dev"
+def IMAGE_VERSION="3.2"
+def SOURCE_NAME="vss-behavior-analytics"
+def slackResponse=notifyBuild(null, 'STARTED')
+
+podTemplate (cloud:'sc-ipp-blossom-prod', yaml : """
+apiVersion: v1
+kind: Pod
+metadata:
+    labels:
+        label: vss-behavior-analytics
+spec:
+  imagePullSecrets:
+  - name: svc-mtmc-ngc-ro-secret
+  containers:
+  - name: python-313
+    image: python:3.13-slim
+    securityContext:
+        privileged: true
+    restartPolicy: Never
+    backoffLimit: 4
+    tty: true
+  - name: docker
+    image: docker:23.0.6-dind
+    securityContext:
+      privileged: true
+    env:
+      - name: DOCKER_TLS_CERTDIR
+        value: ""
+  - name: jenkins-shared-lib-base
+    image: nvcr.io/metropolis/a3ieng/msv:0.0.4
+    imagePullPolicy: "Always"
+    env:
+    - name: JENKINS_URL
+      value: "${env.JENKINS_URL}"
+    command:
+    - sleep
+    args:
+    - 1d
+  nodeSelector:
+    kubernetes.io/os: linux
+"""
+) {
+    node(POD_LABEL) {
+        properties([
+            parameters([
+                string(name: 'EMAIL_REPORT', defaultValue: 'kartikayt@nvidia.com,yunh@nvidia.com,prisrivastav@nvidia.com,munjalp@nvidia.com,gaiyer@nvidia.com', description: 'Email to send the test/build report to'),
+                string(name: 'NGC_ORG', defaultValue: 'nv-metropolis-dev', description: 'NGC org for uploading test results CSV (leave empty to skip upload)'),
+                string(name: 'NGC_TEAM', defaultValue: 'metropolis-analytic', description: 'NGC team for uploading test results CSV'),
+                string(name: 'NGC_RESOURCE_NAME', defaultValue: 'test_results', description: 'NGC resource name for test results CSV'),
+                string(name: 'NGC_RESOURCE_VERSION', defaultValue: '', description: 'NGC resource version (leave empty for <source_name>-<source_version>)'),
+                string(name: 'NGC_API_KEY_CREDENTIAL_ID', defaultValue: 'ngc-personal-key-alert-bridge-evaluator', description: 'Jenkins credential ID for NGC CLI API key')
+            ])
+        ])
+        def ngcVersion = (params.NGC_RESOURCE_VERSION ?: '').trim()
+        def sourceVersion = "${IMAGE_VERSION}-${BUILD_TYPE}${env.BUILD_NUMBER}"
+        def testResultsCsvName = ngcVersion ? "${ngcVersion}.csv" : "${SOURCE_NAME}-${sourceVersion}.csv"
+        try {
+            withEnv(["VERSION_SUFFIX=${BUILD_TYPE}${env.BUILD_NUMBER}", "VSS_BEHAVIOR_ANALYTICS=nvcr.io/nv-metropolis-dev/metropolis-analytic/vss-behavior-analytics"]) {
+                container('python-313') {
+                    stage ("checkout") {
+                        gitlabCommitStatus(name: 'checkout', connection: gitLabConnection('git-lab-master')) {
+                            gitCheckout()
+                        }
+                    }
+                    stage ('test-coverage') {
+                        gitlabCommitStatus(name: 'test-coverage', connection: gitLabConnection('git-lab-master')) {
+                            sh "id -u"
+                            echo "Running Python tests with coverage..."
+                            sh "pip3 install pytest pytest-cov"
+                            sh "pip3 install -e ."
+                            sh "mkdir -p test-coverage"
+                            // Run pytest with JUnit XML and HTML coverage (same paths as reference for publishHTML/junit)
+                            def testExitCode = sh(script: "pytest tests/unit/ -v --junitxml=test-coverage/test-results.xml --cov=mdx --cov-report=html:test-coverage --cov-report=term", returnStatus: true)
+                            echo "\n================================================="
+                            echo "Test Results Summary"
+                            echo "================================================="
+                            sh "pytest tests/unit/ --co -q 2>/dev/null || true"
+                            echo "=================================================\n"
+                            publishHTML([
+                                allowMissing: true,
+                                alwaysLinkToLastBuild: true,
+                                keepAll: true,
+                                reportDir: 'test-coverage',
+                                reportFiles: 'index.html',
+                                reportName: 'Code Coverage Report',
+                                reportTitles: 'Coverage'
+                            ])
+                            if (testExitCode != 0) {
+                                currentBuild.result = 'FAILED'
+                                echo "Tests failed with exit code: ${testExitCode}"
+                            } else {
+                                echo "Tests passed and coverage reports generated"
+                            }
+                        }
+                    }
+                    stage ('publish-test-results') {
+                        junit(
+                            testResults: 'test-coverage/test-results.xml',
+                            allowEmptyResults: true,
+                            skipPublishingChecks: false,
+                            keepLongStdio: true
+                        )
+                        container('jenkins-shared-lib-base') {
+                            script {
+                                dir(env.WORKSPACE) {
+                                    echo "================================"
+                                    echo "Generating AI Test Summary"
+                                    echo "================================"
+                                    def junitXmlPath = "${env.WORKSPACE}/test-coverage/test-results.xml"
+                                    echo "JUnit XML path: ${junitXmlPath}"
+                                    echo "=== TEST OUTPUT (see test-coverage stage) ==="
+                                    sh "cat '${junitXmlPath}' 2>/dev/null | head -c 3000 || echo 'No JUnit XML'"
+                                    echo ""
+                                    def junitExists = sh(script: "test -f '${junitXmlPath}' && echo true || echo false", returnStdout: true).trim() == 'true'
+                                    def testSummary = null
+                                    if (junitExists) {
+                                        try {
+                                            testSummary = summarizeTests(
+                                                junitXmlPath: junitXmlPath,
+                                                provider: 'nim',
+                                                apiKeyCredentialId: 'nvidia-nim-api-key-test',
+                                                model: 'meta/llama-3.1-70b-instruct',
+                                                csvFile: 'test-summary.csv',
+                                                testResultsCsvFile: testResultsCsvName
+                                            )
+                                        } catch (Exception e) {
+                                            echo "⚠️  WARNING: Test summary generation failed: ${e.message}"
+                                            testSummary = [success: false, message: "Parse/generation failed: ${e.message}"]
+                                        }
+                                    } else {
+                                        echo "⚠️  No JUnit XML at ${junitXmlPath}; creating placeholder CSVs"
+                                        testSummary = [success: false, message: 'No JUnit XML - build failed before Test stage']
+                                    }
+                                    if (!testSummary?.success) {
+                                        def jobName = env.JOB_NAME ?: 'unknown'
+                                        def reportUrl = (env.BUILD_URL ?: '') + 'testReport/'
+                                        writeFile file: 'test-summary.csv', text: "\"job_name\",\"total_tests\",\"passed\",\"failed\",\"skipped\",\"pass_rate\",\"test_summary\",\"test_report\"\n\"${jobName}\",\"0\",\"0\",\"0\",\"0\",\"0%\",\"No test results (build failed before Test stage or summary failed).\",\"${reportUrl}\"\n"
+                                        writeFile file: testResultsCsvName, text: "\"Test_Name\",\"Status\",\"Duration_Seconds\",\"Timestamp\",\"Details\",\"Error_Message\"\n\"(no tests)\",\"N/A\",\"0\",\"\",\"No test results - build failed before Test stage or summary failed.\",\"\"\n"
+                                    }
+                                    if (testSummary?.success) {
+                                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                        echo "✅ Test Summary Generated Successfully"
+                                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                        echo "Total Tests: ${testSummary.totalTests}"
+                                        echo "✅ Passed: ${testSummary.passed}"
+                                        echo "❌ Failed: ${testSummary.failed}"
+                                        echo "⏭️  Skipped: ${testSummary.skipped}"
+                                        echo "📊 Test Report: ${testSummary.reportUrl}"
+                                        if (testSummary.testResultsCsvFile) {
+                                            echo "📄 Test results CSV: ${testSummary.testResultsCsvFile}"
+                                        }
+                                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                    }
+                                    def ngcOrg = (params.NGC_ORG ?: '').trim()
+                                    def ngcTeam = (params.NGC_TEAM ?: '').trim()
+                                    def testResultsCsvExists = sh(script: "test -f '${testResultsCsvName}' && echo true || echo false", returnStdout: true).trim() == 'true'
+                                    if (ngcOrg && ngcTeam && testResultsCsvExists) {
+                                        def ngcResourceName = (params.NGC_RESOURCE_NAME ?: 'test_results').trim()
+                                        def paramVersion = (params.NGC_RESOURCE_VERSION ?: '').trim()
+                                        def ngcResourceVersion = (paramVersion == '' || paramVersion.contains('${')) ? "${SOURCE_NAME}-${sourceVersion}" : paramVersion
+                                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                        echo "📤 Uploading test results CSV to NGC: ${ngcOrg}/${ngcTeam}/${ngcResourceName}:${ngcResourceVersion}"
+                                        echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
+                                        withCredentials([string(credentialsId: params.NGC_API_KEY_CREDENTIAL_ID ?: 'ngc-api-key', variable: 'NGC_CLI_API_KEY')]) {
+                                            def pushResult = pushTestResults(
+                                                csvFile: testResultsCsvName,
+                                                ngcOrg: ngcOrg,
+                                                ngcTeam: ngcTeam,
+                                                resourceName: ngcResourceName,
+                                                version: ngcResourceVersion,
+                                                ngcApiKey: env.NGC_CLI_API_KEY,
+                                                shortDesc: "Test results - ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+                                            )
+                                            if (pushResult.success) {
+                                                echo "✅ Test results CSV uploaded to NGC"
+                                            } else {
+                                                echo "⚠️  NGC upload failed: ${pushResult.message}"
+                                            }
+                                        }
+                                    } else if (ngcOrg || ngcTeam) {
+                                        echo "⚠️  NGC upload skipped: set both NGC_ORG and NGC_TEAM and ensure ${testResultsCsvName} exists"
+                                    }
+                                    def emailFilePaths = [
+                                        [path: "test-summary.csv", title: 'Test Summary Report'],
+                                        [path: testResultsCsvName, title: 'Test Results (per-test)']
+                                    ]
+                                    def buildStatus = currentBuild.result ?: 'SUCCESS'
+                                    if (buildStatus != 'SUCCESS') {
+                                        explainError(
+                                            provider: 'nim',
+                                            apiKeyCredentialId: 'nvidia-nim-api-key-test',
+                                            outputFormat: 'csv',
+                                            csvFile: 'build-errors.csv',
+                                            model: 'meta/llama-3.1-70b-instruct'
+                                        )
+                                        emailFilePaths.add([path: "build-errors.csv", title: 'Build Error Analysis'])
+                                    }
+                                    echo "================================"
+                                }
+                            }
+                        }
+                    }
+                    stage ('py-package') {
+                        gitlabCommitStatus(name: 'py-package', connection: gitLabConnection('git-lab-master')) {
+                            sh "apt-get update && apt-get install -y --no-install-recommends curl"
+                            sh "pwd"
+                            sh "ls -lrt"
+                            echo "VERSION_SUFFIX: ${env.VERSION_SUFFIX}"
+                            sh "python --version"                        
+                            sh "pip3 install setuptools wheel"
+                            sh """
+                            python3 setup.py sdist bdist_wheel
+                            ls -lrt dist
+                            """
+                            sh "pip3 install twine"
+                            withCredentials([string(credentialsId: 'sw-mdx-pypi-local-deploy-token', variable: 'TOKEN')]) {
+                                 sh """
+                                 set +xx
+                                 twine upload  --repository-url https://urm.nvidia.com/artifactory/api/pypi/sw-metropolis-pypi-local -u svc-mdx-rw -p $TOKEN dist/vss_behavior_analytics-3.2.0.${env.VERSION_SUFFIX}-py3-none-any.whl --verbose
+                                 export VERSION_SUFFIX=''
+                                 python3 setup.py sdist bdist_wheel
+                                 ls -lrt dist
+                                 echo "Starting deletion of version 3.2.0"
+                                 curl -u svc-mdx-rw:${TOKEN} -X DELETE https://urm.nvidia.com/artifactory/sw-metropolis-pypi-local/vss-behavior-analytics/3.2.0/
+                                 echo "successfully Deleted vss-behavior-analytics-3.2.0"
+                                 twine upload --repository-url https://urm.nvidia.com/artifactory/api/pypi/sw-metropolis-pypi-local -u svc-mdx-rw -p $TOKEN dist/vss_behavior_analytics-3.2.0-py3-none-any.whl --verbose
+                                 """
+                             }
+                            // Write build info for final email (URM URL, image info)
+                            writeFile file: 'build-info.txt', text: """URM_URL=https://urm.nvidia.com/artifactory/sw-metropolis-pypi-local/vss-behavior-analytics/
+IMAGE_NAME=${env.VSS_BEHAVIOR_ANALYTICS}
+IMAGE_VERSION=${IMAGE_VERSION}
+VERSION_SUFFIX=${env.VERSION_SUFFIX}
+"""
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            // If there was an exception thrown, the build failed
+            currentBuild.result = "FAILED"
+            notifyBuild(slackResponse.threadId, currentBuild.result)
+            throw e
+        } finally {
+            stash(includes: "test-summary.csv,${testResultsCsvName}", name: 'test-reports', allowEmpty: true)
+            if (fileExists('build-info.txt')) {
+                stash(includes: 'build-info.txt', name: 'build-info')
+            }
+            if (fileExists('build-errors.csv')) {
+                stash(includes: 'build-errors.csv', name: 'build-errors')
+            }
+        }
+    }
+}
+
+def buildForArch = { String arch ->
+    podTemplate (cloud:'sc-ipp-blossom-prod', yaml : """
+    apiVersion: v1
+    kind: Pod
+    metadata:
+        labels:
+            label: vss-behavior-analytics
+    spec:
+      containers:
+      - name: python-39
+        image: python:3.9.13
+        securityContext:
+            privileged: true
+        restartPolicy: Never
+        backoffLimit: 4
+        tty: true
+      - name: docker
+        image: docker:23.0.6
+        command:
+        - sleep
+        args:
+        - 99d
+        env:
+          - name: DOCKER_HOST
+            value: tcp://localhost:2375
+      - name: docker-daemon
+        image: docker:23.0.6-dind
+        securityContext:
+          privileged: true
+        env:
+          - name: DOCKER_TLS_CERTDIR
+            value: ""
+      nodeSelector:
+        kubernetes.io/os: linux
+        kubernetes.io/arch: ${arch}
+    """
+    ) {
+        node(POD_LABEL) {
+            try {
+                withEnv([
+                    "VERSION_SUFFIX=${BUILD_TYPE}${env.BUILD_NUMBER}",
+                    "VSS_BEHAVIOR_ANALYTICS=nvcr.io/nv-metropolis-dev/metropolis-analytic/vss-behavior-analytics",
+                ]) {
+                    container('python-39') {
+                        stage ("checkout") {
+                            gitlabCommitStatus(name: 'checkout', connection: gitLabConnection('git-lab-master')) {
+                                gitCheckout()
+                            }
+                        }
+                    }
+                    container('docker') {
+                        // Wait for dockerd to be available
+                        stage('nc-dockerd') {
+                            gitlabCommitStatus(name: 'nc-dockerd', connection: gitLabConnection('git-lab-master')) {
+                                script {
+                                    waitForDockerd()
+                                }
+                            }
+                        }
+                        stage ("docker-build") {
+                            gitlabCommitStatus(name: 'docker-build', connection: gitLabConnection('git-lab-master')) {
+                                sh "ls -lrt"
+                                docker.withRegistry('https://nvcr.io', 'NGC_API_KEY_SVC_MDX') {
+                                    dockerBuilder()
+                                    script {
+                                        dockerBuildx(
+                                            image_name: "${env.VSS_BEHAVIOR_ANALYTICS}",
+                                            image_version: "${IMAGE_VERSION}-${arch}",
+                                            dockerfile: "docker/Dockerfile",
+                                            path_to_dockerfile: "."
+                                        )
+                                        dockerBuildx(
+                                            image_name: "${env.VSS_BEHAVIOR_ANALYTICS}",
+                                            image_version: "${IMAGE_VERSION}-${arch}-${env.VERSION_SUFFIX}",
+                                            dockerfile: "docker/Dockerfile",
+                                            path_to_dockerfile: "."
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            } catch (e) {
+                // If there was an exception thrown, the build failed
+                currentBuild.result = "FAILED"
+                notifyBuild(slackResponse.threadId, currentBuild.result)
+                                      throw e
+            }
+        }
+    }
+}
+
+parallel(
+    amd64: { buildForArch('amd64') },
+    arm64: { buildForArch('arm64') }
+)
+
+podTemplate (cloud:'sc-ipp-blossom-prod', yaml : """
+apiVersion: v1
+kind: Pod
+metadata:
+    labels:
+        label: vss-behavior-analytics
+spec:
+  imagePullSecrets:
+  - name: svc-mtmc-ngc-ro-secret
+  containers:
+  - name: docker
+    image: docker:23.0.6
+    command:
+    - sleep
+    args:
+    - 99d
+    env:
+      - name: DOCKER_HOST
+        value: tcp://localhost:2375
+  - name: docker-daemon
+    image: docker:23.0.6-dind
+    securityContext:
+      privileged: true
+    env:
+      - name: DOCKER_TLS_CERTDIR
+        value: ""
+  - name: jenkins-shared-lib-base
+    image: nvcr.io/metropolis/a3ieng/msv:0.0.4
+    imagePullPolicy: "Always"
+    env:
+    - name: JENKINS_URL
+      value: "${env.JENKINS_URL}"
+    command:
+    - sleep
+    args:
+    - 1d
+  nodeSelector:
+    kubernetes.io/os: linux
+"""
+) {
+    node(POD_LABEL) {
+        try {
+            withEnv([
+                "VERSION_SUFFIX=${BUILD_TYPE}${env.BUILD_NUMBER}",
+                "VSS_BEHAVIOR_ANALYTICS=nvcr.io/nv-metropolis-dev/metropolis-analytic/vss-behavior-analytics",
+            ]) {
+                container('docker') {
+                    // Wait for dockerd to be available
+                    stage('nc-dockerd') {
+                        gitlabCommitStatus(name: 'nc-dockerd', connection: gitLabConnection('git-lab-master')) {
+                            script {
+                                waitForDockerd()
+                            }
+                        }
+                    }
+
+                    // Remove the separate publish stage since we're pushing during build
+                    stage ('verify-images') {
+                        gitlabCommitStatus(name: 'verify-images', connection: gitLabConnection('git-lab-master')) {
+                            docker.withRegistry('https://nvcr.io', 'NGC_API_KEY_DEV') {
+                                sh 'echo "Verifying multi-arch images..."'
+                                script {
+                                    dockerVerify(
+                                        image_name: "${env.VSS_BEHAVIOR_ANALYTICS}",
+                                        image_version: "${IMAGE_VERSION}-amd64"
+                                    )
+                                    dockerVerify(
+                                        image_name: "${env.VSS_BEHAVIOR_ANALYTICS}",
+                                        image_version: "${IMAGE_VERSION}-arm64"
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    stage ('merge-images') {
+                        gitlabCommitStatus(name: 'merge-images', connection: gitLabConnection('git-lab-master')) {
+                            docker.withRegistry('https://nvcr.io', 'NGC_API_KEY_DEV') {
+                                sh 'echo "Merging multi-arch images..."'
+                                script {
+                                    dockerMerge(
+                                        image_name: "${env.VSS_BEHAVIOR_ANALYTICS}",
+                                        image_version: "${IMAGE_VERSION}-${env.VERSION_SUFFIX}",
+                                        image_version1: "${IMAGE_VERSION}-amd64-${env.VERSION_SUFFIX}",
+                                        image_version2: "${IMAGE_VERSION}-arm64-${env.VERSION_SUFFIX}"
+                                    )
+                                    dockerMerge(
+                                        image_name: "${env.VSS_BEHAVIOR_ANALYTICS}",
+                                        image_version: "${IMAGE_VERSION}",
+                                        image_version1: "${IMAGE_VERSION}-amd64",
+                                        image_version2: "${IMAGE_VERSION}-arm64"
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        } catch (e) {
+            // If there was an exception thrown, the build failed
+            currentBuild.result = "FAILED"
+                                  throw e
+        } finally {
+            notifyBuild(slackResponse.threadId, currentBuild.result)
+            try { unstash('test-reports') } catch (ignore) { echo 'No test-reports stash' }
+            try { unstash('build-info') } catch (ignore) { echo 'No build-info stash' }
+            try { unstash('build-errors') } catch (ignore) { echo 'No build-errors stash' }
+            container('jenkins-shared-lib-base') {
+                script {
+                    def ngcVersion = (params.NGC_RESOURCE_VERSION ?: '').trim()
+                    def sourceVersion = "${IMAGE_VERSION}-${BUILD_TYPE}${env.BUILD_NUMBER}"
+                    def testResultsCsvName = ngcVersion ? "${ngcVersion}.csv" : "${SOURCE_NAME}-${sourceVersion}.csv"
+                    def emailTo = (params.EMAIL_REPORT ?: '').trim()
+                    if (!emailTo) {
+                        echo "⚠️  EMAIL_REPORT not set; skipping final email"
+                        return
+                    }
+                    def buildStatus = currentBuild.result ?: 'SUCCESS'
+                    def imageName = 'nvcr.io/nv-metropolis-dev/metropolis-analytic/vss-behavior-analytics'
+                    def versionSuffix = "${BUILD_TYPE}${env.BUILD_NUMBER}"
+                    def newImages = """
+New images created (multi-arch):
+  - ${imageName}:${IMAGE_VERSION}
+  - ${imageName}:${IMAGE_VERSION}-${versionSuffix}
+  - ${imageName}:${IMAGE_VERSION}-amd64, ${IMAGE_VERSION}-arm64
+  - ${imageName}:${IMAGE_VERSION}-amd64-${versionSuffix}, ${IMAGE_VERSION}-arm64-${versionSuffix}
+"""
+                    def urmUrl = "N/A"
+                    if (fileExists('build-info.txt')) {
+                        def info = readFile('build-info.txt')
+                        def urmLine = info.split('\n').find { it.startsWith('URM_URL=') }
+                        if (urmLine) urmUrl = urmLine.replaceFirst('URM_URL=', '').trim()
+                    }
+                    def testReportSummary = "See attached test-summary.csv and ${testResultsCsvName} (per-test results)."
+                    def emailSubject = buildStatus == 'SUCCESS' ? "✅ Build Succeeded - ${env.JOB_NAME} #${env.BUILD_NUMBER}" : "❌ Build Failed - ${env.JOB_NAME} #${env.BUILD_NUMBER}"
+                    def emailBody = "${buildStatus == 'SUCCESS' ? 'Build completed successfully!' : 'Build failed with errors.'}\n\n📊 ${testReportSummary}\n\n🐳 ${newImages.trim()}\n\n🔗 URM package URL: ${urmUrl}\n\nBuild URL: ${env.BUILD_URL}\nConsole: ${env.BUILD_URL}console"
+                    if (buildStatus != 'SUCCESS') {
+                        emailBody += "\n\n🔴 Failed test cases / error analysis: see attached build-errors.csv and ${testResultsCsvName}"
+                    }
+                    def emailBodyCrlf = emailBody.replaceAll('\n', '\r\n')
+                    def emailBodyHtml = emailBody.replaceAll('&', '&amp;').replaceAll('<', '&lt;').replaceAll('>', '&gt;').replaceAll('\n', '<br>')
+                    def attachments = []
+                    if (fileExists('test-summary.csv')) attachments.add([path: 'test-summary.csv', title: 'Test Summary Report'])
+                    if (fileExists(testResultsCsvName)) attachments.add([path: testResultsCsvName, title: 'Test Results (per-test)'])
+                    if (fileExists('build-errors.csv')) attachments.add([path: 'build-errors.csv', title: 'Failed Tests / Build Error Analysis'])
+                    if (attachments.isEmpty()) {
+                        echo "⚠️  No report files to attach; sending summary only"
+                    } else {
+                        echo "📧 Sending final email to: ${emailTo} (${attachments.size()} attachments)"
+                        sendEmail(filePaths: attachments, to: emailTo, subject: emailSubject, text: emailBodyCrlf, html: emailBodyHtml)
+                        echo "✅ Final email sent successfully!"
+                    }
+                }
+            }
+        }
+    }
+}
+
+def gitCheckout() {
+    sh 'env | sort'
+    checkout scm
+    sh 'ls -lrt; pwd'
+}
+
+def waitForDockerd() {
+    try {
+        timeout(time: 1, unit: 'MINUTES') {
+            sh("while ! nc -z localhost 2375; do sleep 1; done")
+        }
+    } catch(Throwable daemonException) {
+        error "${daemonException} \nDocker daemon is not available"
+    }
+}
+

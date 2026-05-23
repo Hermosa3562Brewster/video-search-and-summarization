@@ -1,0 +1,30 @@
+__pycache__/
+__py_cache__
+*.egg-info/
+*.so
+
+.vscode/
+.cursor/
+
+build/
+data/
+
+.DS_Store
+
+.pytest_cache
+.coverage
+
+# Test temporary files
+/tmp/
+
+# Local IDE settings
+/.idea/
+
+# For local test use
+testscripts/
+
+/.project
+/.pydevproject
+
+release/spatialai_data_utils/
+release/dist

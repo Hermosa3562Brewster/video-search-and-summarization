@@ -98,16 +98,12 @@ black src/
 ruff check src/
 ```
 
+## Troubleshooting
+
+**Services fail to start:** Run `docker compose logs -f` to check for missing env vars or port conflicts. Make sure `NVIDIA_API_KEY` is set in `.env`.
+
+**Out of GPU memory during ingestion:** Lower `FRAME_EXTRACTION_FPS` or reduce batch size in `.env`. On my RTX 3090, `FRAME_EXTRACTION_FPS=2` works fine but 3+ causes OOM errors with the default VLM.
+
 ## Contributing
 
 Please read [CONTRIBUTING.md](CONTRIBUTING.md) and review our [Pull Request Template](.github/PULL_REQUEST_TEMPLATE.md) before submitting changes.
-
-To report bugs or request features, use the appropriate [issue template](.github/ISSUE_TEMPLATE/).
-
-## License
-
-See [LICENSE](LICENSE) for details.
-
-## Acknowledgements
-
-Built on top of [NVIDIA AI Blueprints](https:

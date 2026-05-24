@@ -1,122 +1,111 @@
-<h2>NVIDIA AI Blueprint: Video Search and Summarization (VSS)</h2>
+# Video Search and Summarization
 
-### Table of Contents
-- [Overview](#overview)
-- [Use Case / Problem Description](#use-case--problem-description)
-- [Agent Workflows](#agent-workflows)
-- [Software Components](#software-components)
-- [Target Audience](#target-audience)
-- [Repository Structure Overview](#repository-structure-overview)
-- [Documentation](#documentation)
-- [Prerequisites](#prerequisites)
-- [Hardware Requirements](#hardware-requirements)
-- [Quickstart Guide](#quickstart-guide)
-- [License](#license)
+A fork of [NVIDIA-AI-Blueprints/video-search-and-summarization](https://github.com/NVIDIA-AI-Blueprints/video-search-and-summarization) — an AI-powered pipeline for searching and summarizing video content using NVIDIA's vision and language models.
 
 ## Overview
 
-The [NVIDIA Blueprint for Video Search and Summarization (VSS)](https://docs.nvidia.com/vss/latest/index.html) provides a suite of reference architectures for building vision agents and AI-powered video analytics applications. Those architectures bring together accelerated vision microservices, vision language models (VLMs), and large language models (LLMs) so you can use them in existing applications, as standalone microservices, or as part of a larger vision agent.
+This project enables users to:
+- **Ingest** video files and extract frames, audio, and metadata
+- **Index** video content using multimodal embeddings for semantic search
+- **Search** across video libraries using natural language queries
+- **Summarize** video segments with AI-generated descriptions
 
-VSS is organized into three areas of processing and analysis: **real-time video intelligence** (feature extraction, embeddings, and stream understanding with results published to a message broker), **downstream analytics** (enrichment of metadata into trajectories, incidents, and verified alerts), and **agentic and offline processing** (orchestrated tools for search, Q&A, summarization, and clip retrieval, including via the Model Context Protocol).
+## Architecture
 
-This repository implements the blueprint and powers the [NVIDIA build experience](https://build.nvidia.com/nvidia/video-search-and-summarization) for natural-language video agents—search, summarization, visual Q&A, and related workflows—backed by generative AI, VLMs and LLMs, and [NVIDIA NIM](https://build.nvidia.com/) microservices as configured in the stacks below.
-
-## Use Case / Problem Description
-
-The NVIDIA AI Blueprint for Video Search and Summarization addresses the challenge of deploying visual agents capable of interacting with large volumes of video data, both stored and streamed. This can be used to create vision AI agents, that can be applied to a multitude of use cases such as monitoring smart spaces, warehouse automation, and SOP validation. This is important where quick and accurate video analysis can lead to better decision-making and enhanced operational efficiency.
-
-## Agent Workflows
-We provide multiple reference [Agent Workflows](https://docs.nvidia.com/vss/3.1.0/adding-workflows.html) which demonstrate how the individual components can be leveraged by an agent:
-
-| Workflow | Description |
-|----------|-------------|
-| [Q&A and Report Generation (Quickstart)](https://docs.nvidia.com/vss/3.1.0/quickstart.html) | Video retrieval, VLM-based Q&A, and report generation on short video clips |
-| [Alert Verification](https://docs.nvidia.com/vss/3.1.0/agent-workflow-alert-verification.html) | Realtime processing of videos using perception (object detection, tracking) and behavior analytics to generate alerts, which are subsequently verified with VLM to reduce false positives |
-| [Real-Time Alerts](https://docs.nvidia.com/vss/3.1.0/agent-workflow-rt-alert.html) | Continuous processing of video streams through VLM for anomaly detection |
-| [Video Search](https://docs.nvidia.com/vss/3.1.0/agent-workflow-search.html) | Natural language search across video archives using video embeddings (alpha) |
-| [Long Video Summarization](https://docs.nvidia.com/vss/3.1.0/agent-workflow-lvs.html) | Analysis and summarization of extended video recordings through chunking and aggregation of dense captions |
-
-## Software Components
-<div align="center">
-  <img src="https://github.com/NVIDIA-AI-Blueprints/video-search-and-summarization/raw/main/assets/vss-architecture.png" width="800">
-</div>
-
-1. **NIM microservices**: Here are models used in this blueprint:
-
-    - [Cosmos-Reason2-8B](https://build.nvidia.com/nvidia/cosmos-reason2-8b)
-    - [NVIDIA Nemotron-Nano-9B-v2](https://build.nvidia.com/nvidia/nvidia-nemotron-nano-9b-v2)
-
-2. **Real-time video intelligence**: The Real-Time Video Intelligence layer extracts rich visual features, semantic embeddings, and contextual understanding from video data in real-time, publishing results to a message broker for downstream analytics and agentic workflows. It provides three core microservices for processing video streams.  
-
-3. **Downstream analytics**: The Downstream Analytics layer processes and enriches the metadata streams generated by real-time video intelligence microservices, transforming raw detections into actionable insights and verified alerts.
-
-4. **Agent and offline processing**: The top-level agent leverages the Model Context Protocol (MCP) to access video analytics data, incident records, and vision processing capabilities through a unified tool interface. It integrates multiple vision-based tools including video understanding with Vision Language Models (VLMs), semantic video search using embeddings, long video summarization for extended footage analysis, and video snapshot/clip retrieval. 
-
-## Target Audience
-This blueprint is designed for ease of setup with extensive configuration options, requiring technical expertise. It is intended for:
-
-1. **Video Analysts and IT Engineers:** Professionals focused on analyzing video data and ensuring efficient processing and summarization. The blueprint offers 1-click deployment steps, easy-to-manage configurations, and plug-and-play models, making it accessible for early developers.
-
-2. **GenAI Developers / Machine Learning Engineers:** Experts who need to customize the blueprint for specific use cases. This includes modifying the pipelines for unique datasets and fine-tuning LLMs as needed. For advanced users, the blueprint provides detailed configuration options and custom deployment possibilities, enabling extensive customization and optimization.
-
-## Repository Structure Overview
-
-| Directory | Description |
-|-----------|-------------|
-| `agent/` | Video search and summarization agent (Python). Contains `src/vss_agents/` (tools, agents, APIs, embeddings, evaluators, video analytics), `tests/`, `stubs/`, `docker/`, and `3rdparty/`. See [agent/README.md](agent/README.md). |
-| `deployments/` | Deployment configs and Docker Compose: NIM model configs (`nim/`), developer workflows (`developer-workflow/` — dev-profile-base, dev-profile-search, dev-profile-alerts, dev-profile-lvs), foundational services, LVS, RTVI, VLM-as-verifier, VST, and root `compose.yml`. |
-| `scripts/` | Deployment and patch scripts, including the Brev launchable notebook (`deploy_vss_launchable.ipynb`) and dev-profile / patch scripts. |
-| `skills/` | [agentskills.io](https://agentskills.io/specification)-compatible agent skills for VSS: one self-contained subdirectory per skill with `SKILL.md` frontmatter. Covers deploy and usage of search, summarization, alerts, VIOS, RT-VLM, LVS, and other related workflows—see the catalog and install notes in [skills/README.md](skills/README.md). |
-| `ui/` | Frontend monorepo (Next.js, Turbo): `apps/` (nemo-agent-toolkit-ui, nv-metropolis-bp-vss-ui) and shared `packages/`. See [ui/README.md](ui/README.md). |
-
-## Documentation
-
-For detailed instructions and additional information about this blueprint, please refer to the [official documentation](https://docs.nvidia.com/vss/3.1.0/index.html).
+```
+┌─────────────────────────────────────────────────────────┐
+│                    Video Search & Summarization          │
+├──────────────┬──────────────┬──────────────┬────────────┤
+│   Ingestion  │   Indexing   │    Search    │ Summarize  │
+│   Pipeline   │   Service    │    API       │  Service   │
+├──────────────┴──────────────┴──────────────┴────────────┤
+│              NVIDIA NIM / NeMo Microservices             │
+│         (VLM, Embeddings, LLM, ASR)                     │
+└─────────────────────────────────────────────────────────┘
+```
 
 ## Prerequisites
 
-### Obtain API Key
+- Docker and Docker Compose
+- NVIDIA GPU (A100, H100, or RTX 3090/4090 recommended)
+- NVIDIA Container Toolkit
+- NVIDIA API Key (for NIM microservices)
+- Python 3.10+
 
-- NVIDIA AI Enterprise developer licence required to local host NVIDIA NIM.
-- API catalog keys:
-   - NVIDIA [API catalog](https://build.nvidia.com/) or [NGC](https://org.ngc.nvidia.com/setup/api-keys) ([steps to generate key](https://docs.nvidia.com/ngc/gpu-cloud/ngc-user-guide/index.html#generating-api-key))
+## Quick Start
 
-## Hardware Requirements
+### 1. Clone the Repository
 
-The platform requirement can vary depending on the configuration and deployment topology used for VSS and dependencies like VLM, LLM, etc. For a list of validated GPU topologies and what configuration to use, see the [GPU requirements](https://docs.nvidia.com/vss/3.1.0/prerequisites.html#development-profile-gpu-requirements).
+```bash
+git clone https://github.com/your-org/video-search-and-summarization.git
+cd video-search-and-summarization
+```
 
-## Quickstart Guide
+### 2. Configure Environment
 
-### Launchable Deployment
+```bash
+cp .env.example .env
+# Edit .env with your NVIDIA API key and configuration
+```
 
-**Ideal for:** Quickly getting started with your own videos without worrying about hardware and software requirements.
+### 3. Launch Services
 
-Follow the steps from the [documentation](https://docs.nvidia.com/vss/3.1.0/cloud-brev.html) and notebook in [scripts](scripts/) directory to complete all pre-requisites and deploy the blueprint using Brev Launchable in a 2xRTX PRO 6000 SE AWS instance.
-- [scripts/deploy_vss_launchable.ipynb](scripts/deploy_vss_launchable.ipynb): This notebook is tailored specifically for the AWS CSP which uses Ephemeral storage.
+```bash
+docker compose up -d
+```
 
-### Docker Compose Deployment
+### 4. Access the UI
 
-**Ideal for:** Deploying a VSS agent on your own hardware or bare metal cloud instance.
+Open your browser and navigate to `http://localhost:3000`
 
-#### System Requirements
+## Configuration
 
-- OS:
-    - x86 hosts: Ubuntu 22.04 or Ubuntu 24.04
-    - DGX-SPARK: DGX OS 7.4.0
-    - IGX-THOR: Jetson Linux BSP (Rel 38.5)
-    - AGX-THOR: Jetson Linux BSP (Rel 38.4)
-- NVIDIA Driver:
-    - 580.105.08 (x86 hosts with Ubuntu 24.04)
-    - 580.65.06 (x86 hosts with Ubuntu 22.04)
-    - 580.95.05 (DGX-SPARK)
-    - 580.00 (IGX-THOR and AGX-THOR)
-- NVIDIA Container Toolkit: 1.17.8+
-- Docker: 27.2.0+
-- Docker Compose: v2.29.0+
-- NGC CLI: 4.10.0+
+Key environment variables:
 
-Please refer to [Prerequisites section here for installation details](https://docs.nvidia.com/vss/3.1.0/prerequisites.html).
+| Variable | Description | Default |
+|---|---|---|
+| `NVIDIA_API_KEY` | NVIDIA NIM API key | required |
+| `VLM_MODEL` | Vision-language model to use | `nvidia/vila` |
+| `EMBEDDING_MODEL` | Embedding model for indexing | `nvidia/nv-embedqa-e5-v5` |
+| `LLM_MODEL` | LLM for summarization | `meta/llama-3.1-70b-instruct` |
+| `VECTOR_DB_URL` | Milvus/pgvector connection URL | `localhost:19530` |
+| `FRAME_EXTRACTION_FPS` | Frames per second to extract | `1` |
 
+## Development
+
+### Setup Local Environment
+
+```bash
+python -m venv venv
+source venv/bin/activate  # On Windows: venv\Scripts\activate
+pip install -r requirements.txt
+```
+
+### Running Tests
+
+```bash
+pytest tests/ -v
+```
+
+### Code Style
+
+This project uses `black` for formatting and `ruff` for linting:
+
+```bash
+black src/
+ruff check src/
+```
+
+## Contributing
+
+Please read [CONTRIBUTING.md](CONTRIBUTING.md) and review our [Pull Request Template](.github/PULL_REQUEST_TEMPLATE.md) before submitting changes.
+
+To report bugs or request features, use the appropriate [issue template](.github/ISSUE_TEMPLATE/).
 
 ## License
-Refer to [LICENSE](LICENSE)
+
+See [LICENSE](LICENSE) for details.
+
+## Acknowledgements
+
+Built on top of [NVIDIA AI Blueprints](https://github.com/NVIDIA-AI-Blueprints/video-search-and-summarization). Special thanks to the NVIDIA team for the original blueprint.

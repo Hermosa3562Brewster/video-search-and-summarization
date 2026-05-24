@@ -69,7 +69,9 @@ Key environment variables:
 | `EMBEDDING_MODEL` | Embedding model for indexing | `nvidia/nv-embedqa-e5-v5` |
 | `LLM_MODEL` | LLM for summarization | `meta/llama-3.1-70b-instruct` |
 | `VECTOR_DB_URL` | Milvus/pgvector connection URL | `localhost:19530` |
-| `FRAME_EXTRACTION_FPS` | Frames per second to extract | `1` |
+| `FRAME_EXTRACTION_FPS` | Frames per second to extract | `2` |
+
+> **Personal note:** I bumped `FRAME_EXTRACTION_FPS` from `1` to `2` — found that 1 fps misses a lot of fast-moving content in the videos I'm working with. May increase further depending on GPU memory availability.
 
 ## Development
 
@@ -108,4 +110,4 @@ See [LICENSE](LICENSE) for details.
 
 ## Acknowledgements
 
-Built on top of [NVIDIA AI Blueprints](https://github.com/NVIDIA-AI-Blueprints/video-search-and-summarization). Special thanks to the NVIDIA team for the original blueprint.
+Built on top of [NVIDIA AI Blueprints](https:

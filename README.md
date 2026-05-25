@@ -102,9 +102,6 @@ ruff check src/
 
 **Services fail to start:** Run `docker compose logs -f` to check for missing env vars or port conflicts. Make sure `NVIDIA_API_KEY` is set in `.env`.
 
-**GPU not detected inside containers:** Verify the NVIDIA Container Toolkit is installed and that `nvidia-smi` works inside a test container:
-```bash
-docker run --rm --gpus all nvidia/cuda:12.0-base nvidia-smi
-```
+**GPU not detected inside containers:** Ensure the NVIDIA Container Toolkit is installed and that `nvidia-smi` works on the host. You may need to restart the Docker daemon after installing the toolkit (`sudo systemctl restart docker`).
 
-> **Personal note:** I hit this on my RTX 4090 workstation after a driver update — reinstalling `nvidia-container-toolkit` and restarting the Docker daemon fixed it.
+**Milvus connection errors:** The vector DB can take 30–60 seconds to become healthy on first boot. If services that depend on it fail immediately, try `docker compose restart` after waiting a moment.

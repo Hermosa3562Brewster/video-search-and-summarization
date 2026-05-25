@@ -102,8 +102,9 @@ ruff check src/
 
 **Services fail to start:** Run `docker compose logs -f` to check for missing env vars or port conflicts. Make sure `NVIDIA_API_KEY` is set in `.env`.
 
-**Out of GPU memory during ingestion:** Lower `FRAME_EXTRACTION_FPS` or reduce batch size in `.env`. On my RTX 3090, `FRAME_EXTRACTION_FPS=2` works fine but 3+ causes OOM errors with the default VLM.
+**GPU not detected inside containers:** Verify the NVIDIA Container Toolkit is installed and that `nvidia-smi` works inside a test container:
+```bash
+docker run --rm --gpus all nvidia/cuda:12.0-base nvidia-smi
+```
 
-## Contributing
-
-Please read [CONTRIBUTING.md](CONTRIBUTING.md) and review our [Pull Request Template](.github/PULL_REQUEST_TEMPLATE.md) before submitting changes.
+> **Personal note:** I hit this on my RTX 4090 workstation after a driver update — reinstalling `nvidia-container-toolkit` and restarting the Docker daemon fixed it.

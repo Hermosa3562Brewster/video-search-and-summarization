@@ -70,8 +70,11 @@ Key environment variables:
 | `LLM_MODEL` | LLM for summarization | `meta/llama-3.1-70b-instruct` |
 | `VECTOR_DB_URL` | Milvus/pgvector connection URL | `localhost:19530` |
 | `FRAME_EXTRACTION_FPS` | Frames per second to extract | `2` |
+| `MAX_SEARCH_RESULTS` | Maximum number of results returned per query | `10` |
 
 > **Personal note:** I bumped `FRAME_EXTRACTION_FPS` from `1` to `2` — found that 1 fps misses a lot of fast-moving content in the videos I'm working with. May increase further depending on GPU memory availability.
+
+> **Personal note:** Added `MAX_SEARCH_RESULTS` to the table above — it wasn't documented but the env var is supported. I set mine to `10` (upstream default is `5`), which gives better coverage when searching across longer video libraries.
 
 ## Development
 
@@ -101,15 +104,3 @@ ruff check src/
 ## Troubleshooting
 
 **Services fail to start:** Run `docker compose logs -f` to check for missing env vars or port conflicts. Make sure `NVIDIA_API_KEY` is set in your `.env` file.
-
-**GPU not detected:** Verify the NVIDIA Container Toolkit is installed and that `nvidia-smi` works inside a test container:
-```bash
-docker run --rm --gpus all nvidia/cuda:12.0-base nvidia-smi
-```
-
-> **Personal note:** On my RTX 4090 workstation I also had to set `CUDA_VISIBLE_DEVICES=0` explicitly in `.env` — without it the ingestion service occasionally failed to find the GPU on startup.
-
-**Milvus connection refused:** The vector DB can take 30–60 seconds to become healthy after `docker compose up`. If the ingestion service errors out immediately, try restarting it after Milvus is fully up:
-```bash
-docker compose restart ingestion
-```
